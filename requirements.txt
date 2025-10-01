@@ -1,0 +1,21 @@
+# Core
+torch==2.4.1     # CUDA 12.1 build, works with your CUDA 12.9 driver
+torchaudio==2.4.1
+torchvision==0.19.1
+# --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Whisper
+openai-whisper==20240930  # latest release, includes word_timestamps
+
+# Audio handling
+pydub==0.25.1
+
+# Utilities
+numpy>=1.24
+tqdm>=4.66
+numba>=0.60
+
+# Web / API
+fastapi==0.111.1
+uvicorn[standard]==0.23.2
+python-multipart>=0.0.7  # required for file uploads
