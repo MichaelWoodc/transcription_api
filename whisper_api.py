@@ -1,19 +1,19 @@
-### Best so far
 # ------------------------------
-# FastAPI Whisper Word Splitter with Padding
+# FastAPI Whisper Word Splitter with Padding + SSE Status
 # ------------------------------
 
 import os
-import tempfile
 import whisper
 import uvicorn
 import nest_asyncio
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydub import AudioSegment
 from datetime import datetime
+import json
+import tempfile
 
 nest_asyncio.apply()
 
@@ -22,13 +22,13 @@ LANGUAGE = "es"
 MODEL_SIZE = "medium"
 DEVICE = "cpu"
 OUTPUT_DIR = "audio_output"
-PADDING_SEC = 0.15  # 100 ms padding before and after word
+PADDING_SEC = 0.15  # 150 ms padding before and after word
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 print("Loading Whisper model...")
 model = whisper.load_model(MODEL_SIZE, device=DEVICE)
-print("Model loaded!")
+print("✅ Model loaded!")
 
 # ---------------- FastAPI ----------------
 app = FastAPI()
@@ -52,72 +52,85 @@ def save_word_audio(audio_segment, word_index, word_text):
     print(f"Saved word audio: {filename}")
     return filename
 
-# ---------------- Endpoints ----------------
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    tmp_path = None
-    try:
-        print(f"Received file: {file.filename} ({file.content_type})")
-        content = await file.read()
-        suffix = "." + file.filename.split(".")[-1] if "." in file.filename else ".wav"
+@app.post("/transcribe_sse")
+async def transcribe_audio_sse(file: UploadFile = File(...)):
+    # Read the entire upload immediately
+    content = await file.read()
 
-        # Save temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
+    async def event_generator():
+        # Notify received
+        yield f"data: {json.dumps({'status': 'received', 'filename': file.filename})}\n\n"
 
-        # Convert to WAV mono 16kHz
-        print("Converting audio to WAV mono 16kHz...")
-        audio = AudioSegment.from_file(tmp_path).set_channels(1).set_frame_rate(16000)
-        wav_path = tmp_path.rsplit(".", 1)[0] + ".wav"
-        audio.export(wav_path, format="wav")
-        print(f"Converted audio saved temporarily as {wav_path}")
+        # Create a unique folder for this upload
+        timestamp_folder = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        safe_name = "".join(c for c in file.filename if c.isalnum() or c in ("-", "_", "."))
+        upload_folder = os.path.join(OUTPUT_DIR, f"{timestamp_folder}_{safe_name}")
+        os.makedirs(upload_folder, exist_ok=True)
 
-        # Transcribe with word-level timestamps
-        print("Transcribing with Whisper...")
-        result = model.transcribe(wav_path, language=LANGUAGE, task="transcribe", word_timestamps=True)
+        # Save original file inside its folder
+        save_path = os.path.join(upload_folder, safe_name)
+        with open(save_path, "wb") as f:
+            f.write(content)
+        yield f"data: {json.dumps({'status': 'saved', 'path': save_path})}\n\n"
+
+        # Load audio
+        audio = AudioSegment.from_file(save_path)
+        yield f"data: {json.dumps({'status': 'transcription_started'})}\n\n"
+
+        # Transcribe
+        result = model.transcribe(save_path, language=LANGUAGE, task="transcribe", word_timestamps=True)
         full_text = result.get("text", "").strip()
         segments = result.get("segments", [])
 
         words_info = []
         word_counter = 0
 
-        # Split audio by words with padding
         for seg in segments:
             for w in seg.get("words", []):
                 word_text = w["word"].strip()
                 start_ms = max(int((w["start"] - PADDING_SEC) * 1000), 0)
                 end_ms = min(int((w["end"] + PADDING_SEC) * 1000), len(audio))
                 word_audio = audio[start_ms:end_ms]
-                word_filename = save_word_audio(word_audio, word_counter, word_text)
+                word_filename = save_word_audio(word_audio, word_counter, word_text, upload_folder)
                 words_info.append({
                     "index": word_counter,
                     "word": word_text,
                     "start": w["start"],
                     "end": w["end"],
-                    "url": f"/audio/{word_filename}"
+                    "url": f"/audio/{os.path.basename(upload_folder)}/{word_filename}"
                 })
+                yield f"data: {json.dumps({'status': 'word_processed', 'word_index': word_counter})}\n\n"
                 word_counter += 1
 
-        # Cleanup temp
-        try:
-            os.remove(tmp_path)
-            os.remove(wav_path)
-        except:
-            pass
+        yield f"data: {json.dumps({'status': 'done', 'text': full_text, 'words_count': len(words_info)})}\n\n"
 
-        print(f"Transcription complete: {full_text}")
-        print(f"{len(words_info)} word files created.")
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-        return JSONResponse({"text": full_text, "words": words_info})
 
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Fallback endpoint for non-SSE transcription"""
+    try:
+        # Read the uploaded file
+        content = await file.read()
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        # Transcribe
+        result = model.transcribe(temp_path, language=LANGUAGE, task="transcribe", word_timestamps=True)
+        
+        # Clean up
+        os.unlink(temp_path)
+        
+        return JSONResponse({
+            "text": result.get("text", "").strip(),
+            "segments": result.get("segments", [])
+        })
+        
     except Exception as e:
-        print(f"Error processing file: {e}")
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except:
-            pass
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/audio_files")
@@ -154,6 +167,7 @@ async def root():
         "message": "Whisper Spanish Word Transcription API",
         "status": "running",
         "endpoints": {
+            "transcribe_sse": "POST /transcribe_sse",
             "transcribe": "POST /transcribe",
             "list_files": "GET /audio_files",
             "play_audio": "GET /play/{filename}",
