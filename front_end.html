@@ -1,0 +1,619 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Batch Word Transcription with Scrolling</title>
+<script src="https://unpkg.com/wavesurfer.js"></script>
+<style>
+:root{
+  --gap: 34vw;
+  --scale-center: 1.2;
+  --scale-side: 0.92;
+  --duration: 420ms;
+  --font-size: 60pt;
+  --bg: #0b0b0b;
+  --fg: #fff;
+  --muted: #bbb;
+}
+
+html,body{
+  height:100%; margin:0; background:var(--bg); color:var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+
+.stage{
+  height:60vh; display:flex; align-items:center; justify-content:center;
+  overflow:hidden; position:relative;
+}
+
+.slot{
+  position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+  white-space:nowrap; font-size:var(--font-size);
+  transition: transform var(--duration) cubic-bezier(.2,.9,.2,1),
+              opacity var(--duration) cubic-bezier(.2,.9,.2,1);
+  pointer-events:none;
+}
+
+.slot.side { color: var(--muted); }
+
+.pos-left   { transform: translate(calc(-50% - var(--gap)), -50%) scale(var(--scale-side)); opacity:0.55; }
+.pos-center { transform: translate(-50%,-50%) scale(var(--scale-center)); opacity:1; }
+.pos-right  { transform: translate(calc(-50% + var(--gap)), -50%) scale(var(--scale-side)); opacity:0.55; }
+.pos-off-right { transform: translate(calc(100vw), -50%) scale(var(--scale-side)); opacity:0; }
+.pos-off-left  { transform: translate(calc(-100vw), -50%) scale(var(--scale-side)); opacity:0.12; }
+
+.controls {
+  position:fixed; left:50%; transform:translateX(-50%);
+  bottom:18px; text-align:center; color:#cfcfcf; font-size:13px;
+  background: rgba(255,255,255,0.02); padding:8px 12px; border-radius:10px; backdrop-filter: blur(4px);
+}
+.controls input[type=range] { width:320px; vertical-align:middle; margin-left:10px; }
+#log {
+  position:fixed; bottom:120px; left:0; right:0;
+  max-height:25vh; overflow-y:auto; background:#111; color:#fff;
+  border-top:1px solid #444; padding:0.5rem;
+  font-size:14px;
+}
+.log-entry { 
+  display: grid; 
+  grid-template-columns: 1fr auto auto; 
+  align-items: center; 
+  margin-bottom:0.3rem; 
+  gap: 10px;
+}
+.playBtn { 
+  cursor:pointer; 
+  padding: 2px 6px;
+  font-size: 12px;
+}
+.waveform { width:150px; height:60px; } 
+.transcript { color: #aaa; font-style: italic; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+.status { 
+  position: fixed;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.8);
+  color: white;
+  padding: 10px 20px;
+  border-radius: 5px;
+  font-size: 14px;
+}
+.progress {
+  position: fixed;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #cfcfcf;
+  font-size: 12px;
+}
+.batch-indicator {
+  position: fixed;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #ffa500;
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+
+<div class="stage" id="stage"></div>
+
+<div class="controls">
+  RMS threshold: <strong id="tval">0.05</strong>
+  <input id="threshold" type="range" min="0.01" max="0.35" step="0.005" value="0.05">
+  <button id="sendBatch">📤 Send Full Audio</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+const words = (`uhe aha uho ohi ahe ahi oha eho uhu iha aha uhi iha ihe uho
+ihu uhe eho oha uhi oha eha ihi ihi eho uhi uhe ihe ohi oha`).split(/\s+/);
+
+const stage = document.getElementById('stage');
+const thresholdSlider = document.getElementById('threshold');
+const tval = document.getElementById('tval');
+const logDiv = document.getElementById('log');
+const sendBatchBtn = document.getElementById('sendBatch');
+
+tval.textContent = thresholdSlider.value;
+thresholdSlider.addEventListener('input',()=>{ tval.textContent = Number(thresholdSlider.value).toFixed(3); });
+
+let currentIdx = 0;
+let slots = [];
+let mediaStream, audioContext, mediaRecorder;
+let armed = true;
+let audioChunks = [];
+let fullAudioBlob = null;
+const displayedWords = [];
+// const API_URL="http://127.0.0.1:8000/transcribe";
+const API_URL="https://speech.michaelwoodcock.duckdns.org/transcribe";
+// Batch management variables
+let currentBatchNumber = 1;
+let currentBatchWords = [];
+let wordsSinceLastSubmission = 0;
+const SUBMISSION_INTERVAL = 5;
+let isUploading = false;
+let uploadQueue = [];
+
+// --- Carousel functions ---
+function makeSlot(idx,posClass){
+  const el=document.createElement('div');
+  el.className='slot';
+  if(posClass==='pos-left'||posClass==='pos-right') el.classList.add('side');
+  el.dataset.idx=idx;
+  el.textContent=words[idx];
+  el.classList.add(posClass);
+  stage.appendChild(el);
+  slots.push({el,idx});
+  return el;
+}
+
+function findSlotByIdx(idx){ return slots.find(s=>s.idx===idx); }
+
+function initSlots(){
+  stage.innerHTML=''; slots=[]; currentIdx=0;
+  makeSlot(0,'pos-center');
+  if(words[1]) makeSlot(1,'pos-right');
+  if(words[2]) makeSlot(2,'pos-off-right');
+}
+initSlots();
+
+// --- Microphone init + RMS scrolling ---
+async function initMic(){
+  try{
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true
+      }
+    });
+    
+    // Start the first batch recording
+    startNewBatchRecording();
+    
+    audioContext = new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.5;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+
+    let triggerCooldown = false;
+
+    function check(){
+      if (!audioContext) return;
+      
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for(let i = 0; i < data.length; i++){ 
+        const v = (data[i] - 128) / 128; 
+        sum += v * v; 
+      }
+      const rms = Math.sqrt(sum / data.length);
+      const thr = parseFloat(thresholdSlider.value);
+      
+      if(rms > thr && armed && !triggerCooldown){ 
+        console.log("Triggering scroll - RMS:", rms, "Threshold:", thr);
+        triggerScroll(); 
+        armed = false;
+        triggerCooldown = true;
+        
+        setTimeout(() => { 
+          triggerCooldown = false; 
+        }, 300);
+        
+        setTimeout(() => { 
+          armed = true; 
+        }, 600);
+      }
+      else if(rms < thr * 0.4) {
+        armed = true;
+      }
+      
+      requestAnimationFrame(check);
+    }
+    check();
+  }catch(e){ 
+    console.error("Microphone initialization failed:", e);
+    alert("Could not access microphone. Please check permissions and try again.");
+  }
+}
+
+// --- Start new batch recording ---
+function startNewBatchRecording() {
+  audioChunks = [];
+  currentBatchWords = [];
+  
+  if (mediaStream) {
+    // Stop previous recorder if it exists
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+    }
+    
+    mediaRecorder = new MediaRecorder(mediaStream, {
+      mimeType: 'audio/webm; codecs=opus'
+    });
+    
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        audioChunks.push(event.data);
+      }
+    };
+    
+    mediaRecorder.onstop = () => {
+      // This will be handled by the batch submission process
+    };
+    
+    mediaRecorder.start(1000); // Collect data every second
+    console.log(`Started recording batch ${currentBatchNumber}`);
+  }
+}
+
+// --- Word recording (local only) ---
+function startRecordingWord(idx){
+  if(!mediaStream) return;
+  
+  // Add word to current batch
+  currentBatchWords.push(words[idx]);
+  
+  const chunks = [];
+  const options = { mimeType: 'audio/webm; codecs=opus' };
+  const rec = new MediaRecorder(mediaStream, options);
+  rec.ondataavailable = e=>{ if(e.data.size>0) chunks.push(e.data); };
+  rec.onstop = ()=>{
+    const blob = new Blob(chunks,{type:'audio/webm'});
+    displayedWords.push({word:words[idx], idx, time:performance.now()});
+    logWord(blob, words[idx]);
+  };
+  rec.start();
+  setTimeout(()=>{
+    if(rec.state === 'recording') rec.stop();
+  }, 500);
+}
+
+// --- Logging each word ---
+function logWord(blob, word){
+  const entry = document.createElement('div'); 
+  entry.className="log-entry";
+
+  const txt = document.createElement("span"); 
+  txt.textContent = word; 
+  txt.style.fontWeight='bold';
+  
+  const transcript = document.createElement("span"); 
+  transcript.className="transcript"; 
+  transcript.textContent="…";
+  
+  const playBtn = document.createElement("button"); 
+  playBtn.textContent="▶️"; 
+  playBtn.className="playBtn";
+  
+  const waveDiv = document.createElement("div"); 
+  waveDiv.className="waveform";
+
+  const ws = WaveSurfer.create({
+    container: waveDiv, 
+    waveColor:'#0f0', 
+    progressColor:'#ff0', 
+    height:60, 
+    normalize:true
+  });
+  ws.loadBlob(blob);
+  playBtn.onclick=()=>ws.playPause();
+
+  entry.appendChild(txt);
+  entry.appendChild(transcript);
+  entry.appendChild(playBtn);
+  entry.appendChild(waveDiv);
+  logDiv.appendChild(entry);
+  logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+// --- Carousel scroll ---
+let animating=false;
+function triggerScroll(){
+  if(animating || currentIdx>=words.length) return;
+  animating=true;
+  startRecordingWord(currentIdx);
+
+  const newOffRightIdx = currentIdx+3;
+  if(words[newOffRightIdx] && !findSlotByIdx(newOffRightIdx)) makeSlot(newOffRightIdx,'pos-off-right');
+
+  slots.forEach(s=>{
+    const el=s.el; el.classList.remove('pos-left','pos-center','pos-right','pos-off-right','pos-off-left');
+    const idx=s.idx;
+    if(idx===currentIdx-1) el.classList.add('pos-off-left');
+    else if(idx===currentIdx) el.classList.add('pos-left','side');
+    else if(idx===currentIdx+1) el.classList.add('pos-center');
+    else if(idx===currentIdx+2) el.classList.add('pos-right','side');
+    else if(idx===currentIdx+3) el.classList.add('pos-off-right');
+    else el.classList.add('pos-off-left');
+  });
+
+  setTimeout(()=>{
+    slots = slots.filter(s=>{ if(s.el.classList.contains('pos-off-left')){ stage.removeChild(s.el); return false; } return true; });
+    currentIdx++;
+    slots.forEach(s=>{
+      s.el.classList.remove('pos-left','pos-center','pos-right','pos-off-right','pos-off-left');
+      if(s.idx===currentIdx-1) s.el.classList.add('pos-left','side');
+      if(s.idx===currentIdx) s.el.classList.add('pos-center');
+      if(s.idx===currentIdx+1) s.el.classList.add('pos-right','side');
+      if(s.idx===currentIdx+2) s.el.classList.add('pos-off-right');
+    });
+    animating=false;
+    
+    // Check if we've reached the submission interval
+    wordsSinceLastSubmission++;
+    if (wordsSinceLastSubmission >= SUBMISSION_INTERVAL) {
+      wordsSinceLastSubmission = 0;
+      prepareBatchForSubmission();
+    }
+    
+    showProgress();
+  }, 450);
+}
+
+// --- Prepare batch for submission ---
+function prepareBatchForSubmission() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    
+    // Wait for the onstop event to fire and chunks to be finalized
+    mediaRecorder.onstop = async () => {
+      const batchData = {
+        batchNumber: currentBatchNumber,
+        words: [...currentBatchWords],
+        audioChunks: [...audioChunks],
+        startIndex: currentIdx - SUBMISSION_INTERVAL
+      };
+      
+      // Add to upload queue
+      uploadQueue.push(batchData);
+      
+      // Start upload process if not already running
+      if (!isUploading) {
+        processUploadQueue();
+      }
+      
+      // Start new batch recording
+      currentBatchNumber++;
+      startNewBatchRecording();
+    };
+  }
+}
+
+// --- Process upload queue sequentially ---
+async function processUploadQueue() {
+  if (isUploading || uploadQueue.length === 0) return;
+  
+  isUploading = true;
+  
+  while (uploadQueue.length > 0) {
+    const batchData = uploadQueue[0]; // Get first item without removing
+    
+    try {
+      await submitBatchToServer(batchData);
+      // Remove successfully uploaded batch from queue
+      uploadQueue.shift();
+    } catch (error) {
+      console.error(`Failed to upload batch ${batchData.batchNumber}:`, error);
+      // Stop processing on error to prevent losing data
+      break;
+    }
+  }
+  
+  isUploading = false;
+}
+
+// --- Submit batch to server ---
+async function submitBatchToServer(batchData) {
+  showStatus(`🔄 Converting batch ${batchData.batchNumber} to WAV...`);
+  
+  const fullWebmBlob = new Blob(batchData.audioChunks, {type: 'audio/webm'});
+  const wavBlob = await convertToWav(fullWebmBlob);
+  
+  // Create filename with words
+  const wordsString = batchData.words.slice(0, 3).join('_'); // Use first 3 words in filename
+  const filename = `batch_${batchData.batchNumber}_${wordsString}.wav`;
+  
+  const formData = new FormData();
+  formData.append("file", wavBlob, filename);
+
+  showStatus(`📤 Uploading ${filename}...`);
+  
+  const res = await fetch(API_URL, {
+    method: "POST", 
+    body: formData
+  });
+  
+  if (!res.ok) {
+    throw new Error(`Server error: ${res.status} ${res.statusText}`);
+  }
+  
+  const data = await res.json();
+  console.log(`✅ Batch ${batchData.batchNumber} upload complete:`, data);
+  
+  // Update the log with server-transcribed words
+  const wordsData = data.words || [];
+  const startIndex = batchData.startIndex;
+  
+  wordsData.forEach((wordInfo, i)=>{
+    const absoluteIndex = startIndex + i;
+    const entry = logDiv.children[absoluteIndex];
+    if(entry && entry.querySelector(".transcript")){
+      entry.querySelector(".transcript").textContent = wordInfo.word;
+    }
+  });
+  
+  showStatus(`✅ Batch ${batchData.batchNumber} transcribed!`);
+  return true;
+}
+
+// --- Show status message ---
+function showStatus(message) {
+  let statusDiv = document.querySelector('.status');
+  if (!statusDiv) {
+    statusDiv = document.createElement('div');
+    statusDiv.className = 'status';
+    document.body.appendChild(statusDiv);
+  }
+  statusDiv.textContent = message;
+  setTimeout(() => {
+    if (statusDiv.textContent === message) {
+      statusDiv.remove();
+    }
+  }, 3000);
+}
+
+// --- Show progress ---
+function showProgress() {
+  let progressDiv = document.querySelector('.progress');
+  if (!progressDiv) {
+    progressDiv = document.createElement('div');
+    progressDiv.className = 'progress';
+    document.body.appendChild(progressDiv);
+  }
+  
+  let batchDiv = document.querySelector('.batch-indicator');
+  if (!batchDiv) {
+    batchDiv = document.createElement('div');
+    batchDiv.className = 'batch-indicator';
+    document.body.appendChild(batchDiv);
+  }
+  
+  progressDiv.textContent = `Words: ${currentIdx}/${words.length} | Next batch in: ${SUBMISSION_INTERVAL - wordsSinceLastSubmission} words`;
+  batchDiv.textContent = `Current Batch: ${currentBatchNumber} (${currentBatchWords.length} words)`;
+}
+
+// --- Convert WebM to WAV (16kHz, mono, 16-bit) ---
+function convertToWav(webmBlob) {
+  return new Promise((resolve, reject) => {
+    const audioContext = new AudioContext();
+    const fileReader = new FileReader();
+    
+    fileReader.onload = function() {
+      audioContext.decodeAudioData(fileReader.result, (audioBuffer) => {
+        const targetSampleRate = 16000;
+        const numberOfChannels = 1;
+        const length = audioBuffer.length * targetSampleRate / audioBuffer.sampleRate;
+        
+        const offlineContext = new OfflineAudioContext(
+          numberOfChannels, 
+          length, 
+          targetSampleRate
+        );
+        
+        const source = offlineContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(offlineContext.destination);
+        source.start();
+        
+        offlineContext.startRendering().then(renderedBuffer => {
+          const frameCount = renderedBuffer.length;
+          const wavBuffer = new ArrayBuffer(44 + frameCount * numberOfChannels * 2);
+          const view = new DataView(wavBuffer);
+          
+          const writeString = (offset, string) => {
+            for (let i = 0; i < string.length; i++) {
+              view.setUint8(offset + i, string.charCodeAt(i));
+            }
+          };
+          
+          writeString(0, 'RIFF');
+          view.setUint32(4, 36 + frameCount * numberOfChannels * 2, true);
+          writeString(8, 'WAVE');
+          writeString(12, 'fmt ');
+          view.setUint32(16, 16, true);
+          view.setUint16(20, 1, true);
+          view.setUint16(22, numberOfChannels, true);
+          view.setUint32(24, targetSampleRate, true);
+          view.setUint32(28, targetSampleRate * numberOfChannels * 2, true);
+          view.setUint16(32, numberOfChannels * 2, true);
+          view.setUint16(34, 16, true);
+          writeString(36, 'data');
+          view.setUint32(40, frameCount * numberOfChannels * 2, true);
+          
+          let offset = 44;
+          const channelData = renderedBuffer.getChannelData(0);
+          
+          for (let i = 0; i < frameCount; i++) {
+            const sample = Math.max(-1, Math.min(1, channelData[i]));
+            view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+            offset += 2;
+          }
+          
+          const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+          resolve(wavBlob);
+        });
+      }, reject);
+    };
+    
+    fileReader.onerror = reject;
+    fileReader.readAsArrayBuffer(webmBlob);
+  });
+}
+
+// --- Send full audio to server as WAV ---
+sendBatchBtn.onclick = async ()=>{
+  if(audioChunks.length===0) return alert("No audio recorded!");
+  sendBatchBtn.disabled=true;
+
+  try {
+    // Submit current batch first if it has words
+    if (currentBatchWords.length > 0) {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+        
+        // Wait for current batch to be added to queue
+        await new Promise(resolve => {
+          const originalOnStop = mediaRecorder.onstop;
+          mediaRecorder.onstop = () => {
+            if (originalOnStop) originalOnStop();
+            resolve();
+          };
+        });
+      }
+    }
+    
+    // Process any remaining batches in queue
+    if (uploadQueue.length > 0) {
+      showStatus("Processing remaining batches...");
+      await processUploadQueue();
+    }
+    
+    showStatus("All batches uploaded successfully!");
+    
+  }catch(e){ 
+    console.error("Upload failed:", e);
+    showStatus("Upload failed!");
+    alert("Upload failed: " + e.message);
+  }
+  finally{ 
+    sendBatchBtn.disabled=false; 
+  }
+};
+
+// --- Start microphone & scrolling ---
+initMic();
+stage.addEventListener('click',()=>triggerScroll());
+window.addEventListener('keydown', e=>{
+  if(e.code==='Space'){
+    e.preventDefault(); 
+    triggerScroll();
+  }
+});
+
+// Initial progress display
+showProgress();
+</script>
+</body>
+</html>
